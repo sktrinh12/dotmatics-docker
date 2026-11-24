@@ -1,0 +1,149 @@
+# syntax=docker/dockerfile:1.4
+# =============================================================================
+# Dotmatics Platform 6.2 — BASE image
+# Amazon Linux 2 (RHEL-compatible)
+# Reference: Install, Upgrade, and Requirements Guide v1.4
+#   §6.2.2 Java, §6.2.3 Tomcat, §6.2.4 permissions, §6.2.6 UTF-8,
+#   §6.2.7 SSL (delegated to runtime), §6.4 OpenBabel, §6.5.4 fonts
+# =============================================================================
+FROM amazonlinux:2
+
+LABEL org.opencontainers.image.title="dotmatics-base" \
+      org.opencontainers.image.description="Dotmatics 6.2 base: Corretto 11, Tomcat 8.5, OpenBabel 3.2, fonts" \
+      org.opencontainers.image.version="6.2" \
+      org.opencontainers.image.vendor="Dotmatics" \
+      com.dotmatics.platform.version="6.2"
+
+ARG USERNAME=dotmatics
+ARG USER_UID=1000
+ARG USER_GID=1000
+ARG TOMCAT_VERSION=8.5.77
+ARG OPENBABEL_VERSION=3.2.1
+ARG CORRETTO_VERSION=11.0.14.9-1
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=UTC \
+    JAVA_HOME=/usr/lib/jvm/java-11-amazon-corretto \
+    CATALINA_HOME=/opt/tomcat/apache-tomcat-${TOMCAT_VERSION} \
+    CATALINA_BASE=/opt/tomcat/apache-tomcat-${TOMCAT_VERSION} \
+    PATH=/opt/tomcat/apache-tomcat-${TOMCAT_VERSION}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ---- 1. Java (Corretto 11) ------------------------------------------------
+RUN set -eux \
+    && export GNUPGHOME="$(mktemp -d)" \
+    && curl -fsSL -o /tmp/corretto.key https://yum.corretto.aws/corretto.key \
+    && gpg --batch --import /tmp/corretto.key \
+    && gpg --batch --export --armor '6DC3636DAE534049C8B94623A122542AB04F24E3' > /tmp/corretto.asc \
+    && rpm --import /tmp/corretto.asc \
+    && rm -r "$GNUPGHOME" /tmp/corretto.key /tmp/corretto.asc \
+    && curl -fsSL -o /etc/yum.repos.d/corretto.repo https://yum.corretto.aws/corretto.repo \
+    && grep -q '^gpgcheck=1' /etc/yum.repos.d/corretto.repo \
+    && echo "priority=9" >> /etc/yum.repos.d/corretto.repo \
+    && yum install -y java-11-amazon-corretto-devel-${CORRETTO_VERSION} \
+    && find /usr/lib/jvm/java-11-amazon-corretto -name src.zip -delete || true \
+    && yum clean all
+
+# ---- 2. EPEL + runtime + fonts + build tools ------------------------------
+# Runtime libs (cairo, libxml2, zlib, bzip2, python3) are explicitly listed so
+# `yum remove -y <build-tool>` later cannot orphan them.
+RUN set -eux \
+    && amazon-linux-extras install -y epel \
+    && yum install -y \
+         # runtime
+         fontconfig shadow-utils sudo which curl tar gzip unzip findutils procps-ng \
+         python3 cairo libxml2 zlib bzip2 \
+         # fonts — §6.5.4 "Tomcat Custom Font packages"
+         dejavu-sans-fonts dejavu-serif-fonts dejavu-sans-mono-fonts \
+         liberation-sans-fonts liberation-serif-fonts liberation-mono-fonts \
+         # build-only (removed in cleanup step)
+         gcc-c++ make cmake3 swig python3-devel \
+         cairo-devel zlib-devel bzip2-devel libxml2-devel eigen3-devel \
+    && fc-cache -f -v \
+    && yum clean all
+
+# ---- 3. Tomcat ------------------------------------------------------------
+RUN set -eux \
+    && curl -fsSL --retry 3 -o /tmp/tomcat.tar.gz \
+         "https://archive.apache.org/dist/tomcat/tomcat-8/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz" \
+    && mkdir -p /opt/tomcat \
+    && tar -xzf /tmp/tomcat.tar.gz -C /opt/tomcat \
+    && rm -f /tmp/tomcat.tar.gz \
+    && chmod +x "${CATALINA_HOME}/bin/"*.sh \
+    && rm -rf "${CATALINA_HOME}/webapps"/* \
+    # production hardening: disable the 8005 shutdown port
+    && sed -i 's|<Server port="8005" shutdown="SHUTDOWN">|<Server port="-1" shutdown="SHUTDOWN">|' \
+         "${CATALINA_HOME}/conf/server.xml"
+
+# setenv.sh is auto-sourced by catalina.sh — safer than sed-editing catalina.sh
+RUN cat > "${CATALINA_HOME}/bin/setenv.sh" <<'EOF'
+#!/bin/sh
+# Tomcat auto-sources this file.
+# Override at runtime with:  -e DOTMATICS_JAVA_OPTS="-Xmx4g -XX:+UseG1GC"
+: "${DOTMATICS_JAVA_OPTS:=-Xmx2048m -XX:+UseG1GC}"
+export JAVA_OPTS="${JAVA_OPTS} ${DOTMATICS_JAVA_OPTS} -Dfile.encoding=UTF-8 -Djava.awt.headless=true"
+EOF
+RUN chmod +x "${CATALINA_HOME}/bin/setenv.sh"
+
+# ---- 4. OpenBabel -------------------------------------
+RUN set -eux \
+    && OB_TAG="openbabel-$(echo ${OPENBABEL_VERSION} | tr '.' '-')" \
+    && curl -fsSL --retry 3 -o /tmp/openbabel.tar.gz \
+         "https://github.com/openbabel/openbabel/archive/refs/tags/${OB_TAG}.tar.gz" \
+    && tar -xzf /tmp/openbabel.tar.gz -C /tmp \
+    && SRC_DIR="/tmp/openbabel-${OB_TAG}" \
+    # Fix 1: Correct the typo so the build system can find the variable.
+    && sed -i 's/eigen2_define/eigen_define/g' "${SRC_DIR}/scripts/CMakeLists.txt" \
+    # Fix 2: Prevent SWIG from being passed the conflicting -DHAVE_EIGEN3 flag.
+    # Set the variable to an empty string so the flag is not added.
+    && sed -i 's/set (eigen_define "-DHAVE_EIGEN3")/set (eigen_define "")/' "${SRC_DIR}/scripts/CMakeLists.txt" \
+    # Fix 3: Apply the upstream/Debian patch to the SWIG interface file.
+    # Change the preprocessor guard from HAVE_EIGEN to HAVE_EIGEN3.
+    && sed -i 's/#ifdef HAVE_EIGEN$/#ifdef HAVE_EIGEN3/g' "${SRC_DIR}/scripts/openbabel-python.i" \
+    # Fix 4: Ensure the necessary headers are included when HAVE_EIGEN3 is defined.
+    && sed -i '/#ifdef HAVE_EIGEN3/a %{\n#include <openbabel/conformersearch.h>\n#include <openbabel/math/align.h>\n%}' \
+         "${SRC_DIR}/scripts/openbabel-python.i" \
+    && mkdir -p "${SRC_DIR}/build" \
+    && cd "${SRC_DIR}/build" \
+    && cmake3 \
+         -D CMAKE_INSTALL_PREFIX=/usr \
+         -D CMAKE_BUILD_TYPE=Release \
+         -D PYTHON_BINDINGS=ON \
+         -D RUN_SWIG=ON \
+         -D PYTHON_EXECUTABLE=/usr/bin/python3 \
+         .. \
+    && (make -j"$(nproc)" || make -j1 VERBOSE=1) \
+    && make install \
+    && ldconfig \
+    && rm -rf /tmp/openbabel.tar.gz "${SRC_DIR}"
+
+# ---- 5. Validate everything (fails build if broken) ----------------------
+RUN set -eux \
+    && java -version 2>&1 | head -3 \
+    && obabel -V 2>&1 \
+    && python3 -c "from openbabel import openbabel, pybel; print('OpenBabel Python bindings OK')" \
+    && "${CATALINA_HOME}/bin/version.sh"
+
+# ---- 6. Non-root user -----------------------------------------------------
+RUN set -eux \
+    && groupadd -g "${USER_GID}" "${USERNAME}" \
+    && useradd -m -u "${USER_UID}" -g "${USERNAME}" -s /bin/bash "${USERNAME}" \
+    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
+    && chmod 0440 /etc/sudoers.d/${USERNAME} \
+    && chown -R "${USERNAME}:${USERNAME}" /opt/tomcat \
+    && mkdir -p /home/${USERNAME}/dotmatics/{config,data,logs} \
+    && chown -R "${USERNAME}:${USERNAME}" /home/${USERNAME}/dotmatics
+
+# ---- 7. Remove build-only packages ---------------------------------------
+RUN set -eux \
+    && yum remove -y \
+         gcc-c++ gcc make cmake3 swig python3-devel \
+         cairo-devel zlib-devel bzip2-devel libxml2-devel eigen3-devel \
+    && yum clean all \
+    && rm -rf /var/cache/yum /var/cache/dnf /tmp/*
+
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+
+# Build:  docker build -t dotmatics-base:6.2 -f Dockerfile.base .
+# Test: docker run --rm dotmatics-openbabel bash -c "obabel -V && python3 -c 'import openbabel; print(openbabel.__file__)'"
